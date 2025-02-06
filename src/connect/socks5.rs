@@ -1,22 +1,24 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
 use anyhow::Context;
-use futures_util::TryFutureExt;
+use futures_util::{AsyncReadExt, TryFutureExt};
 use psl::Psl;
 use smol_timeout::TimeoutExt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::{
     china,
-    connect::{
-        stats::{STATS_RECV_BYTES, STATS_SEND_BYTES},
-        tunnel::activity::notify_activity,
-        TUNNEL,
-    },
+    connect::stats::{STATS_RECV_BYTES, STATS_SEND_BYTES},
 };
 
+use super::ConnectContext;
+
 /// Handles a socks5 client from localhost
-async fn handle_socks5(s5client: smol::net::TcpStream, exclude_prc: bool) -> anyhow::Result<()> {
+async fn handle_socks5(
+    ctx: ConnectContext,
+    s5client: smol::net::TcpStream,
+    exclude_prc: bool,
+) -> anyhow::Result<()> {
     s5client.set_nodelay(true)?;
     use socksv5::v5::*;
     let _handshake = read_handshake(s5client.clone()).await?;
@@ -73,7 +75,8 @@ async fn handle_socks5(s5client: smol::net::TcpStream, exclude_prc: bool) -> any
         )
         .await?;
     } else {
-        let conn = TUNNEL
+        let conn = ctx
+            .tunnel
             .connect_stream(&addr)
             .timeout(Duration::from_secs(120))
             .await
@@ -85,14 +88,13 @@ async fn handle_socks5(s5client: smol::net::TcpStream, exclude_prc: bool) -> any
             port,
         )
         .await?;
+        let (conn_read, conn_write) = conn.split();
         smol::future::race(
-            geph4_aioutils::copy_with_stats(conn.clone(), s5client.clone(), |n| {
+            geph4_aioutils::copy_with_stats(conn_read, s5client.clone(), |n| {
                 STATS_RECV_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-                notify_activity();
             }),
-            geph4_aioutils::copy_with_stats(s5client, conn, |n| {
+            geph4_aioutils::copy_with_stats(s5client, conn_write, |n| {
                 STATS_SEND_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-                notify_activity();
             }),
         )
         .await?;
@@ -100,8 +102,8 @@ async fn handle_socks5(s5client: smol::net::TcpStream, exclude_prc: bool) -> any
     Ok(())
 }
 
-pub async fn socks5_loop(socks5_listen: SocketAddr, exclude_prc: bool) -> anyhow::Result<()> {
-    let socks5_listener = smol::net::TcpListener::bind(socks5_listen)
+pub async fn socks5_loop(ctx: ConnectContext) -> anyhow::Result<()> {
+    let socks5_listener = smol::net::TcpListener::bind(ctx.opt.socks5_listen)
         .await
         .context("cannot bind socks5")?;
     log::debug!("socks5 started");
@@ -112,8 +114,8 @@ pub async fn socks5_loop(socks5_listen: SocketAddr, exclude_prc: bool) -> anyhow
             .context("cannot accept socks5")?;
 
         smolscale::spawn(
-            async move { handle_socks5(s5client, exclude_prc).await }
-                .map_err(|e| log::debug!("socks5 died with: {:?}", e)),
+            handle_socks5(ctx.clone(), s5client, ctx.opt.exclude_prc)
+                .map_err(|e| log::debug!("local socks5 handler died with: {:?}", e)),
         )
         .detach()
     }
